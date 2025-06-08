@@ -44,7 +44,21 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
-# Application questions (edit these directly in the script)
+# Server-specific storage
+server_data = {
+    # guild_id: {
+    #   'declined': {user_id: datetime},
+    #   'banned': {user_id: {'reason': str, 'date': datetime}},
+    #   'history': {user_id: list of application history}
+    # }
+}
+
+# Global storage for cross-server reference
+global_declined = {}  # user_id : datetime_of_decline
+global_banned = {}     # user_id : {"reason": str, "date": datetime}
+pending_applications = {}  # user_id: {"message_id": int, "role_type": str, "guild_id": int}
+
+# Application questions
 questions = {
     "Staff": [
         "1. Why do you want to be staff?",
@@ -85,13 +99,9 @@ questions = {
 }
 
 application_status = {"Staff": True, "Media": True, "Developer": True}
-declined_applicants = {}  # user_id : datetime_of_decline
-banned_applicants = {}  # user_id : {"reason": str, "date": datetime}
-application_history = {}  # user_id: list of {"action": str, "role": str, "date": datetime, "moderator": str}
-pending_applications = {}  # user_id: {"message_id": int, "role_type": str}
 
 class RoleSelect(ui.Select):
-    def __init__(self):
+    def __init__(self, guild_id: int):
         options = []
         if application_status["Staff"]:
             options.append(discord.SelectOption(label="Staff", description="Apply for Staff role", emoji="🛡️"))
@@ -106,27 +116,54 @@ class RoleSelect(ui.Select):
             max_values=1,
             options=options
         )
+        self.guild_id = guild_id
 
     async def callback(self, interaction: discord.Interaction):
         role_type = self.values[0]
+        guild_id = interaction.guild.id
 
-        # Check ban
-        if interaction.user.id in banned_applicants:
-            ban_info = banned_applicants[interaction.user.id]
+        # Initialize server data if not exists
+        if guild_id not in server_data:
+            server_data[guild_id] = {'declined': {}, 'banned': {}, 'history': {}}
+
+        # Check global ban first
+        if interaction.user.id in global_banned:
+            ban_info = global_banned[interaction.user.id]
             await interaction.response.send_message(
-                f"❌ You are banned from applying.\nReason: {ban_info['reason']}\nBanned on: {ban_info['date'].strftime('%Y-%m-%d %H:%M UTC')}",
+                f"❌ You are globally banned from applying.\nReason: {ban_info['reason']}\nBanned on: {ban_info['date'].strftime('%Y-%m-%d %H:%M UTC')}",
                 ephemeral=True
             )
             return
 
-        # Check recent decline (48h cooldown)
-        last_decline = declined_applicants.get(interaction.user.id)
+        # Check server-specific ban
+        if interaction.user.id in server_data[guild_id]['banned']:
+            ban_info = server_data[guild_id]['banned'][interaction.user.id]
+            await interaction.response.send_message(
+                f"❌ You are banned from applying in this server.\nReason: {ban_info['reason']}\nBanned on: {ban_info['date'].strftime('%Y-%m-%d %H:%M UTC')}",
+                ephemeral=True
+            )
+            return
+
+        # Check global decline cooldown (48h)
+        last_decline = global_declined.get(interaction.user.id)
         if last_decline and datetime.utcnow() < last_decline + timedelta(hours=48):
             remaining = (last_decline + timedelta(hours=48)) - datetime.utcnow()
             hours = int(remaining.total_seconds() // 3600)
             minutes = int((remaining.total_seconds() % 3600) // 60)
             await interaction.response.send_message(
                 f"❌ You were declined recently. You can reapply in {hours}h {minutes}m.",
+                ephemeral=True
+            )
+            return
+
+        # Check server-specific decline cooldown (24h)
+        server_decline = server_data[guild_id]['declined'].get(interaction.user.id)
+        if server_decline and datetime.utcnow() < server_decline + timedelta(hours=24):
+            remaining = (server_decline + timedelta(hours=24)) - datetime.utcnow()
+            hours = int(remaining.total_seconds() // 3600)
+            minutes = int((remaining.total_seconds() % 3600) // 60)
+            await interaction.response.send_message(
+                f"❌ You were declined in this server recently. You can reapply here in {hours}h {minutes}m.",
                 ephemeral=True
             )
             return
@@ -138,24 +175,25 @@ class RoleSelect(ui.Select):
                 description="Click below to begin your application.",
                 color=discord.Color.blurple()
             )
-            await interaction.user.send(embed=embed, view=StartApplicationView(role_type))
+            await interaction.user.send(embed=embed, view=StartApplicationView(role_type, guild_id))
             await interaction.followup.send("📩 Check your DMs to continue your application.", ephemeral=True)
         except discord.Forbidden:
             await interaction.followup.send("❌ I couldn't DM you. Please check your privacy settings.", ephemeral=True)
 
 class ApplicationView(ui.View):
-    def __init__(self):
+    def __init__(self, guild_id: int):
         super().__init__(timeout=None)
-        self.add_item(RoleSelect())
+        self.add_item(RoleSelect(guild_id))
 
 class ReasonModal(ui.Modal, title="Enter Reason"):
-    def __init__(self, action:str, applicant:discord.User, role_type:str, interaction:discord.Interaction, message_id:int):
+    def __init__(self, action: str, applicant: discord.User, role_type: str, interaction: discord.Interaction, message_id: int, guild_id: int):
         super().__init__()
         self.action = action  # 'accept' or 'decline'
         self.applicant = applicant
         self.role_type = role_type
         self.interaction = interaction
         self.message_id = message_id
+        self.guild_id = guild_id
 
         self.reason = ui.TextInput(label="Reason", style=discord.TextStyle.paragraph, required=True, max_length=300)
         self.add_item(self.reason)
@@ -165,12 +203,16 @@ class ReasonModal(ui.Modal, title="Enter Reason"):
         if self.applicant.id in pending_applications and pending_applications[self.applicant.id].get("message_id") == self.message_id:
             reason_text = self.reason.value
 
+            # Initialize server data if not exists
+            if self.guild_id not in server_data:
+                server_data[self.guild_id] = {'declined': {}, 'banned': {}, 'history': {}}
+
             # Notify applicant & mods
             if self.action == "accept":
                 try:
                     await self.applicant.send(embed=discord.Embed(
                         title="✅ Application Accepted",
-                        description=f"Your application for **{self.role_type}** at O.L.A Studios has been accepted.\n\n**Reason:** {reason_text}",
+                        description=f"Your application for **{self.role_type}** has been accepted.\n\n**Reason:** {reason_text}",
                         color=discord.Color.green()
                     ))
                     await self.log_decision(interaction, "accepted", reason_text)
@@ -178,13 +220,16 @@ class ReasonModal(ui.Modal, title="Enter Reason"):
                 except discord.Forbidden:
                     await interaction.response.send_message("✅ Accepted but couldn't DM the applicant.", ephemeral=True)
             elif self.action == "decline":
-                declined_applicants[self.applicant.id] = datetime.utcnow()
+                # Add to both global and server-specific decline records
+                global_declined[self.applicant.id] = datetime.utcnow()
+                server_data[self.guild_id]['declined'][self.applicant.id] = datetime.utcnow()
+                
                 try:
                     await self.applicant.send(embed=discord.Embed(
                         title="❌ Application Declined",
                         description=(
-                            f"Your application at O.L.A Studios has been declined.\n\n**Reason:** {reason_text}\n"
-                            "You can open a new application in the next 48 hours."
+                            f"Your application has been declined.\n\n**Reason:** {reason_text}\n"
+                            "You can open a new application in the next 48 hours (globally) or 24 hours (in this server)."
                         ),
                         color=discord.Color.red()
                     ))
@@ -202,11 +247,11 @@ class ReasonModal(ui.Modal, title="Enter Reason"):
         self.stop()
 
     async def log_decision(self, interaction: discord.Interaction, action: str, reason: str = None):
-        # Add to history
-        if self.applicant.id not in application_history:
-            application_history[self.applicant.id] = []
+        # Add to server history
+        if self.applicant.id not in server_data[self.guild_id]['history']:
+            server_data[self.guild_id]['history'][self.applicant.id] = []
         
-        application_history[self.applicant.id].append({
+        server_data[self.guild_id]['history'][self.applicant.id].append({
             "action": action,
             "role": self.role_type,
             "date": datetime.utcnow(),
@@ -216,11 +261,9 @@ class ReasonModal(ui.Modal, title="Enter Reason"):
         
         # Find the log channel
         log_channel = None
-        for guild in bot.guilds:
-            channel = discord.utils.get(guild.text_channels, name=LOG_CHANNEL_NAME)
-            if channel:
-                log_channel = channel
-                break
+        guild = bot.get_guild(self.guild_id)
+        if guild:
+            log_channel = discord.utils.get(guild.text_channels, name=LOG_CHANNEL_NAME)
         
         if log_channel:
             embed = discord.Embed(
@@ -237,26 +280,30 @@ class ReasonModal(ui.Modal, title="Enter Reason"):
             await log_channel.send(embed=embed)
 
 class ReviewView(ui.View):
-    def __init__(self, applicant: discord.User, role_type: str, message_id: int):
+    def __init__(self, applicant: discord.User, role_type: str, message_id: int, guild_id: int):
         super().__init__(timeout=None)
         self.applicant = applicant
         self.role_type = role_type
         self.message_id = message_id
+        self.guild_id = guild_id
         self.processed = False
 
+        # Initialize server data if not exists
+        if self.guild_id not in server_data:
+            server_data[self.guild_id] = {'declined': {}, 'banned': {}, 'history': {}}
+
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        # Check if this application has already been processed
         if self.processed or (self.applicant.id in pending_applications and pending_applications[self.applicant.id].get("message_id") != self.message_id):
             await interaction.response.send_message("⚠️ This application has already been processed.", ephemeral=True)
             return False
         return True
 
     async def log_decision(self, interaction: discord.Interaction, action: str, reason: str = None):
-        # Add to history
-        if self.applicant.id not in application_history:
-            application_history[self.applicant.id] = []
+        # Add to server history
+        if self.applicant.id not in server_data[self.guild_id]['history']:
+            server_data[self.guild_id]['history'][self.applicant.id] = []
         
-        application_history[self.applicant.id].append({
+        server_data[self.guild_id]['history'][self.applicant.id].append({
             "action": action,
             "role": self.role_type,
             "date": datetime.utcnow(),
@@ -264,13 +311,16 @@ class ReviewView(ui.View):
             "reason": reason
         })
         
+        # Add to global and server-specific data if declined
+        if action == "declined":
+            global_declined[self.applicant.id] = datetime.utcnow()
+            server_data[self.guild_id]['declined'][self.applicant.id] = datetime.utcnow()
+        
         # Find the log channel
         log_channel = None
-        for guild in bot.guilds:
-            channel = discord.utils.get(guild.text_channels, name=LOG_CHANNEL_NAME)
-            if channel:
-                log_channel = channel
-                break
+        guild = bot.get_guild(self.guild_id)
+        if guild:
+            log_channel = discord.utils.get(guild.text_channels, name=LOG_CHANNEL_NAME)
         
         if log_channel:
             embed = discord.Embed(
@@ -291,7 +341,7 @@ class ReviewView(ui.View):
         try:
             await self.applicant.send(embed=discord.Embed(
                 title="✅ Application Accepted",
-                description=f"Congratulations! Your application for **{self.role_type}** at O.L.A Studios has been accepted.",
+                description=f"Congratulations! Your application for **{self.role_type}** has been accepted.",
                 color=discord.Color.green()
             ))
             await self.log_decision(interaction, "accepted")
@@ -305,13 +355,14 @@ class ReviewView(ui.View):
 
     @ui.button(label="Decline", style=discord.ButtonStyle.danger)
     async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
-        declined_applicants[self.applicant.id] = datetime.utcnow()
+        global_declined[self.applicant.id] = datetime.utcnow()
+        server_data[self.guild_id]['declined'][self.applicant.id] = datetime.utcnow()
         try:
             await self.applicant.send(embed=discord.Embed(
                 title="❌ Application Declined",
                 description=(
-                    "Your application at O.L.A Studios has been declined. "
-                    "You can open a new application in the next 48 hours."
+                    "Your application has been declined. "
+                    "You can open a new application in the next 48 hours (globally) or 24 hours (in this server)."
                 ),
                 color=discord.Color.red()
             ))
@@ -326,18 +377,19 @@ class ReviewView(ui.View):
 
     @ui.button(label="Accept with Reason", style=discord.ButtonStyle.success, row=1)
     async def accept_reason(self, interaction: discord.Interaction, button: discord.ui.Button):
-        modal = ReasonModal("accept", self.applicant, self.role_type, interaction, self.message_id)
+        modal = ReasonModal("accept", self.applicant, self.role_type, interaction, self.message_id, self.guild_id)
         await interaction.response.send_modal(modal)
 
     @ui.button(label="Decline with Reason", style=discord.ButtonStyle.danger, row=1)
     async def decline_reason(self, interaction: discord.Interaction, button: discord.ui.Button):
-        modal = ReasonModal("decline", self.applicant, self.role_type, interaction, self.message_id)
+        modal = ReasonModal("decline", self.applicant, self.role_type, interaction, self.message_id, self.guild_id)
         await interaction.response.send_modal(modal)
 
 class StartApplicationView(ui.View):
-    def __init__(self, role_type: str):
+    def __init__(self, role_type: str, guild_id: int):
         super().__init__(timeout=None)
         self.role_type = role_type
+        self.guild_id = guild_id
 
     @ui.button(label="Start Application", style=discord.ButtonStyle.primary)
     async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -364,21 +416,23 @@ class StartApplicationView(ui.View):
         )
         for q, a in answers:
             embed.add_field(name=q, value=a, inline=False)
-        embed.set_footer(text=f"User ID: {interaction.user.id}")
+        embed.set_footer(text=f"User ID: {interaction.user.id} | Guild ID: {self.guild_id}")
 
         sent = False
-        for guild in bot.guilds:
+        guild = bot.get_guild(self.guild_id)
+        if guild:
             channel = discord.utils.get(guild.text_channels, name=LOG_CHANNEL_NAME)
             if channel:
                 try:
                     # Send @here ping before the embed
                     message = await channel.send("@here New application received!")
-                    await channel.send(embed=embed, view=ReviewView(interaction.user, self.role_type, message.id))
+                    await channel.send(embed=embed, view=ReviewView(interaction.user, self.role_type, message.id, self.guild_id))
                     
                     # Track this pending application
                     pending_applications[interaction.user.id] = {
                         "message_id": message.id,
-                        "role_type": self.role_type
+                        "role_type": self.role_type,
+                        "guild_id": self.guild_id
                     }
                     
                     sent = True
@@ -391,7 +445,6 @@ class StartApplicationView(ui.View):
                             await member.send(f"📨 {interaction.user} just submitted a **{self.role_type}** application.")
                         except discord.Forbidden:
                             print(f"❌ Couldn't DM {member}")
-                break
 
         if sent:
             await interaction.user.send(embed=discord.Embed(
@@ -406,7 +459,7 @@ class StartApplicationView(ui.View):
 @app_commands.checks.has_role(DEV_ROLE_NAME)
 async def application(interaction: discord.Interaction):
     embed = discord.Embed(
-        title="📋 One Last Attempt Applications",
+        title="📋 Application System",
         description=(
             "Interested in joining the team? Use the dropdown below to apply for a role!\n"
             "We're currently looking for talented Developers and dedicated Staff members.\n"
@@ -414,7 +467,7 @@ async def application(interaction: discord.Interaction):
         ),
         color=discord.Color.teal()
     )
-    await interaction.response.send_message(embed=embed, view=ApplicationView())
+    await interaction.response.send_message(embed=embed, view=ApplicationView(interaction.guild.id))
 
 @tree.command(name="application_open", description="Open applications for a specific role")
 @app_commands.describe(role_type="Which application type to open")
@@ -455,31 +508,67 @@ async def application_close(interaction: discord.Interaction, role_type: str):
         await interaction.response.send_message(f"⛔ {role_type} applications are now closed!", ephemeral=False)
 
 @tree.command(name="applicationban", description="Ban a user from applying")
-@app_commands.describe(user="User to ban", reason="Reason for ban")
+@app_commands.describe(
+    user="User to ban",
+    reason="Reason for ban",
+    global_ban="Whether to ban globally (default: server only)"
+)
 @app_commands.checks.has_role(DEV_ROLE_NAME)
-async def applicationban(interaction: discord.Interaction, user: discord.User, reason: str):
-    banned_applicants[user.id] = {"reason": reason, "date": datetime.utcnow()}
-    await interaction.response.send_message(f"🔨 {user} has been banned from applying.\nReason: {reason}", ephemeral=False)
+async def applicationban(interaction: discord.Interaction, user: discord.User, reason: str, global_ban: bool = False):
+    ban_info = {"reason": reason, "date": datetime.utcnow()}
+    
+    if global_ban:
+        global_banned[user.id] = ban_info
+        await interaction.response.send_message(f"🔨 {user} has been globally banned from applying.\nReason: {reason}", ephemeral=False)
+    else:
+        guild_id = interaction.guild.id
+        if guild_id not in server_data:
+            server_data[guild_id] = {'declined': {}, 'banned': {}, 'history': {}}
+        server_data[guild_id]['banned'][user.id] = ban_info
+        await interaction.response.send_message(f"🔨 {user} has been banned from applying in this server.\nReason: {reason}", ephemeral=False)
 
 @tree.command(name="applicationunban", description="Unban a user from applying")
-@app_commands.describe(user="User to unban")
+@app_commands.describe(
+    user="User to unban",
+    global_unban="Whether to unban globally (default: server only)"
+)
 @app_commands.checks.has_role(DEV_ROLE_NAME)
-async def applicationunban(interaction: discord.Interaction, user: discord.User):
-    if user.id in banned_applicants:
-        banned_applicants.pop(user.id)
-        await interaction.response.send_message(f"✅ {user} has been unbanned and can now apply.", ephemeral=False)
+async def applicationunban(interaction: discord.Interaction, user: discord.User, global_unban: bool = False):
+    if global_unban:
+        if user.id in global_banned:
+            global_banned.pop(user.id)
+            await interaction.response.send_message(f"✅ {user} has been globally unbanned and can now apply.", ephemeral=False)
+        else:
+            await interaction.response.send_message(f"❌ {user} is not globally banned.", ephemeral=True)
     else:
-        await interaction.response.send_message(f"❌ {user} is not banned.", ephemeral=True)
+        guild_id = interaction.guild.id
+        if guild_id in server_data and user.id in server_data[guild_id]['banned']:
+            server_data[guild_id]['banned'].pop(user.id)
+            await interaction.response.send_message(f"✅ {user} has been unbanned in this server and can now apply here.", ephemeral=False)
+        else:
+            await interaction.response.send_message(f"❌ {user} is not banned in this server.", ephemeral=True)
 
 @tree.command(name="applicationbans", description="List all users banned from applying")
+@app_commands.describe(show_global="Whether to show global bans (default: server only)")
 @app_commands.checks.has_role(DEV_ROLE_NAME)
-async def applicationbans(interaction: discord.Interaction):
-    if not banned_applicants:
-        await interaction.response.send_message("There are no banned users.", ephemeral=True)
+async def applicationbans(interaction: discord.Interaction, show_global: bool = False):
+    guild_id = interaction.guild.id
+    
+    if not show_global and (guild_id not in server_data or not server_data[guild_id]['banned']):
+        await interaction.response.send_message("There are no server-specific banned users.", ephemeral=True)
+        return
+    elif show_global and not global_banned:
+        await interaction.response.send_message("There are no globally banned users.", ephemeral=True)
         return
 
-    embed = discord.Embed(title="Application Ban List", color=discord.Color.red())
-    for user_id, info in banned_applicants.items():
+    embed = discord.Embed(
+        title="Global Ban List" if show_global else "Server Ban List",
+        color=discord.Color.red()
+    )
+    
+    ban_data = global_banned if show_global else server_data.get(guild_id, {}).get('banned', {})
+    
+    for user_id, info in ban_data.items():
         user = bot.get_user(user_id)
         username = user.name if user else f"User ID {user_id}"
         embed.add_field(
@@ -487,28 +576,59 @@ async def applicationbans(interaction: discord.Interaction):
             value=f"Reason: {info['reason']}\nBanned on: {info['date'].strftime('%Y-%m-%d %H:%M UTC')}",
             inline=False
         )
+    
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @tree.command(name="applicationhistory", description="View a user's application history")
-@app_commands.describe(user="The user to check history for")
+@app_commands.describe(
+    user="The user to check history for",
+    show_global="Whether to show global history (default: server only)"
+)
 @app_commands.checks.has_role(DEV_ROLE_NAME)
-async def application_history_command(interaction: discord.Interaction, user: discord.User):
-    if user.id not in application_history or not application_history[user.id]:
-        await interaction.response.send_message(f"ℹ️ No application history found for {user.mention}.", ephemeral=True)
-        return
+async def application_history_command(interaction: discord.Interaction, user: discord.User, show_global: bool = False):
+    guild_id = interaction.guild.id
+    
+    # Initialize server data if not exists
+    if guild_id not in server_data:
+        server_data[guild_id] = {'declined': {}, 'banned': {}, 'history': {}}
+    
+    # Get the appropriate history
+    if show_global:
+        # Combine all server histories for this user
+        all_history = []
+        for gid, data in server_data.items():
+            if user.id in data.get('history', {}):
+                all_history.extend(data['history'][user.id])
+        
+        if not all_history:
+            await interaction.response.send_message(f"ℹ️ No global application history found for {user.mention}.", ephemeral=True)
+            return
+        
+        history_source = "Global"
+        history_entries = sorted(all_history, key=lambda x: x['date'], reverse=True)
+    else:
+        if user.id not in server_data[guild_id]['history'] or not server_data[guild_id]['history'][user.id]:
+            await interaction.response.send_message(f"ℹ️ No server-specific application history found for {user.mention}.", ephemeral=True)
+            return
+        
+        history_source = "Server"
+        history_entries = sorted(server_data[guild_id]['history'][user.id], key=lambda x: x['date'], reverse=True)
     
     embed = discord.Embed(
-        title=f"Application History for {user}",
+        title=f"{history_source} Application History for {user}",
         color=discord.Color.blue()
     )
     
-    for entry in application_history[user.id]:
+    for entry in history_entries[:25]:  # Limit to 25 entries to avoid embed limits
         status = "✅ Accepted" if entry["action"] == "accepted" else "❌ Declined"
         embed.add_field(
             name=f"{entry['role']} - {entry['date'].strftime('%Y-%m-%d %H:%M')}",
             value=f"{status} by {entry['moderator']}" + (f"\nReason: {entry['reason']}" if entry.get("reason") else ""),
             inline=False
         )
+    
+    if len(history_entries) > 25:
+        embed.set_footer(text=f"Showing 25 of {len(history_entries)} total entries")
     
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
